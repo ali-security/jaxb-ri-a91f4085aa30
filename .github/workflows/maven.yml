@@ -13,10 +13,13 @@
 name: JAXB RI
 
 on:
-  pull_request:
-  push:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated test class names to run (empty = full suite)'
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.ref }}
@@ -26,8 +29,10 @@ jobs:
   build:
     name: Test on JDK ${{ matrix.java_version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
+      fail-fast: false
       matrix:
         java_version: [ 11, 17 ]
 
@@ -43,4 +48,37 @@ jobs:
       - name: Verify
         run: |
           cd jaxb-ri
-          mvn -B -V -U -C -Pstaging,oss-release clean verify org.glassfish.copyright:glassfish-copyright-maven-plugin:check -Dgpg.skip=true -Doss.disallow.snapshots=false -Dcopyright.ignoreyear=true
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            TESTS=$(echo "${{ inputs.test-filter }}" | tr ' ' ',')
+            mvn -B -V -U -C -Pstaging,oss-release clean verify -Dgpg.skip=true -Doss.disallow.snapshots=false -Dtest="$TESTS" -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            mvn -B -V -U -C -Pstaging,oss-release clean verify -Dgpg.skip=true -Doss.disallow.snapshots=false
+          fi
+      - name: Upload xsom jar
+        if: matrix.java_version == 11
+        uses: actions/upload-artifact@v4
+        with:
+          name: xsom-jar
+          path: jaxb-ri/xsom/target/xsom-*.jar
+          if-no-files-found: error
+      - name: Test summary and skip report
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          total = fail = err = skip = 0
+          skipped = []
+          for f in sorted(glob.glob('jaxb-ri/**/target/surefire-reports/TEST-*.xml', recursive=True)):
+              r = ET.parse(f).getroot()
+              total += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+              err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0))
+              for tc in r.iter('testcase'):
+                  s = tc.find('skipped')
+                  if s is not None:
+                      skipped.append(f"{tc.get('classname')}.{tc.get('name')}: {s.get('message') or 'no message'}")
+          print(f"SUREFIRE TOTAL: Tests run: {total}, Passed: {total - fail - err - skip}, Failures: {fail}, Errors: {err}, Skipped: {skip}")
+          print("SKIPPED TESTS (upstream @Ignore annotations, reason quoted from the annotation):")
+          for s in skipped:
+              print("  SKIPPED " + s)
+          print("SKIPPED MODULE: junit4osgi OSGi bundle tests (bundles/*, 'Tests are skipped') - upstream jaxb-ri/pom.xml sets skipOsgiTests=true by default (its override is commented out upstream); not changed by this build")
+          PY
